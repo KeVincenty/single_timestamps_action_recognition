@@ -167,7 +167,7 @@ Here you will find the following files and folders:
 - `models/`: folder containing PyTorch checkpoints. Each checkpoint stores both the model and the
 optimiser's state. These are used for automatically resuming your run if you want to stop the program
 - `results/`: folder containing CSV files, one per tested epoch, as well as confusion matrices 
-- `training_dicts/`: folder containing training information, one per epoch, exported only when running 
+- `training_dicts/`: folder containing training information, exported only when running 
 *ts* and *ts_in_gt* baselines
 - `test_info.csv`: CSV file containing loss, top-1 and top-5 accuracy per tested epoch
 - `train_info.csv`: CSV file containing loss, top-1 and top-5 accuracy per training epoch
@@ -188,7 +188,7 @@ The CSV files contain useful information gathered during testing, namely the fol
 
 #### `training_dicts/` content
 
-This folder is organised in sub-folders, open per epoch, as follows:
+This folder is organised in sub-folders, one per epoch, as follows:
 
 `training_dicts/epoch_${epoch_number}/${video_id}/`
 
@@ -377,6 +377,7 @@ assumption on the model, and only needs to receive classification scores for eac
 Here are some directions for adding a new model:
 
 - Look for the following in `src/run.py`
+
   ```python
   raise Exception('Unrecognised model: {}'.format(settings['model_name']))
   ```
@@ -384,6 +385,7 @@ Here are some directions for adding a new model:
   you need to implement your changes to add a new model
 - Edit the `src/softmax_scores.py` file to extract softmax scores with your new model
 - If necessary, change the way data is loaded in `src/dataset.py`. Functions to have a look at are:
+
   - `load_rgb_frames(self, video, frame_samples)`
   - `load_flow_frames(self, video, frame_samples)`
   - `generate_frame_samples(self, video, samples_are0_indexed=True)`
