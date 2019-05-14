@@ -1,0 +1,50 @@
+---
+baseline: gt  # should be either 'ts' or 'gt'
+dataset_name: beoid # should be either 'beoid' or 'thumos_14', or match your dataset name
+mode: flow # should be either 'rgb' or 'flow'
+model_name: tsn_bni # if you want to the method with another model, use this property to switch models. At the moment only 'tsn_bni' is implemented
+annotation_path: '../annotations/beoid' # path to the annotations folder
+n_epochs: 1000 # number of epochs
+save_softmax_scores: False # whether you want to save the softmax scores of the untrimmed training videos during update
+kinetics_init: True # whether you want to load the kinetics weights
+gpus: '0,1' # use this to set the gpus you want to use
+load_checkpoint_epoch: 0 # what epoch you want to start from. Set to -1 if you want to start from the scratch, 0 to load the last one
+export_frequency: 20 # how often we save a checkpoint of the model (in epochs)
+export_base_folder: '/media/deepthought/DATA2/Davide' # path where you want to save models and results
+frames_path: '/media/deepthought/SCRATCH/beoid/frames' # path to the rgb/flow frames
+of_stack_size: 5 # optical flow size
+training:
+  n_samples: 5 # how many points you want to sample from each plateau/gt segment (depending on the baseline)
+  batch_size: 64 # the GPU batch size for training. Set this according to your GPU memory
+  accumulate_for_batch_size: 256 # the training batch size. You can set this to a number > batch_size in order to train with a big batch
+  batch_size_untrimmed : 256 # GPU batch size for getting the softmax scores for the untrimmed videos
+  learning_rate: 0.0001 # the learning rate
+  num_workers: 4 # the number of workers for the PyTorch data loader, for training
+  num_workers_untrimmed: 4 # the number of workers for the PyTorch data loader, for the untrimmed softmax scores
+  h: 0.5 # the CL h parameter for the base model curriculum learning
+  cl_training: True # whether you want to run with base model curriculum learning or not
+  h_step: 0.05 # how much you want to increase h at each update step
+  cl_frequency: 5 # how often you want to run the curriculum learning step (i.e. rank the frames) (in epochs)
+plateaus_initial_parameters:
+  w: 45 # the initial plateau width
+  s: 0.75 # the initial plateau slope
+fit:
+  min_tau: 0.1 # minimum tau for producing update proposals
+  max_tau: 1 # maximum tau for producing update proposals
+  tau_step : 0.1 # tau step for producing update proposals
+  min_cc_length: 5 # minimum connected component length, to filter garbage fits
+  softmax_stride: 5 # stride used when extracting softmax scores to produce update proposals
+update:
+  no_update: False # set this to False if you never want to start the update
+  frequency: 1 # how often you want to update the plateaus (in epochs)
+  start_epoch: 500 # when you want to start the update
+  lc: 0.5 # update velocity for parameter c
+  lw: 0.25 # update velocity for parameter w
+  ls: 0.25 # update velocity for parameter s
+  z: 0.25 # the CL z parameter for selecting the update proposal
+testing:
+  frequency: 10 # how often you want to test the model (in epochs)
+  batch_size: 1 # batch size for testing, keep this to 1
+  num_workers: 8 # the number of workers for the PyTorch data loader
+  n_crops: 1  # number of crops, should be either 1 (only centre crop) or 10 (centre and corner crops, including their flipped versions)
+  n_samples: 10 # how many samples you want to test on. These will be uniformly sampled withing the ground truth bounds
