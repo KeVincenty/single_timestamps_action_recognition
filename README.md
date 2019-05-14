@@ -377,7 +377,6 @@ assumption on the model, and only needs to receive classification scores for eac
 Here are some directions for adding a new model:
 
 - Look for the following in `src/run.py`
-
   ```python
   raise Exception('Unrecognised model: {}'.format(settings['model_name']))
   ```
