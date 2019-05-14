@@ -72,10 +72,9 @@ necessary configuration to run the code.
 Run the code with argument `-h` to print the usage of the script and check out the optional arguments:
 
 ```bash
-usage: run.py [-h] [--tag [TAG]] [--test_only [TEST_ONLY]] [--epoch [EPOCH]]
+usage: run.py [-h] [--tag [TAG]] [--test_only] [--epoch [EPOCH]]
               [--checkpoint_path [CHECKPOINT_PATH]] [--override [OVERRIDE]]
-              [--start_from_best_in [START_FROM_BEST_IN]]
-              [--get_scores_only [GET_SCORES_ONLY]]
+              [--start_from_best_in [START_FROM_BEST_IN]] [--get_scores_only]
               settings_path
 
 positional arguments:
@@ -84,8 +83,7 @@ positional arguments:
 optional arguments:
   -h, --help            show this help message and exit
   --tag [TAG]           tag to be appended to the export folder
-  --test_only [TEST_ONLY]
-                        only test the model
+  --test_only           only test the model
   --epoch [EPOCH]       load checkpoint saved at given epoch from the export
                         folder
   --checkpoint_path [CHECKPOINT_PATH]
@@ -97,10 +95,10 @@ optional arguments:
                         the given export folder. If passing argument
                         --test_only will start from the model with highest
                         top-1 accuracy in testing
-  --get_scores_only [GET_SCORES_ONLY]
-                        get only the softmax and logit scores for the
+  --get_scores_only     get only the softmax and logit scores for the
                         untrimmed training videos. The scores will be saved to
                         the export folder
+
 ```
 
 ## YAML settings
@@ -157,6 +155,7 @@ in the settings file with the property `export_base_folder`. The base folder is 
 - TensorBoard logs folder: `logs/${dataset_name}/${baseline}/tsn_bni/`
 
 Where:
+
 - `${dataset_name}` is the dataset's name, either *beoid* or *thumos_14* in the provided settings
 - `${baseline}` is the baseline, either *ts*, *ts_in_gt* or *gt*
 - `tsn_bni` stands for the model name, in this case TSN with based on Batch Normalisation Inception. 
@@ -177,6 +176,7 @@ optimiser's state. These are used for automatically resuming your run if you wan
 #### Results CSV
 
 The CSV files contain useful information gathered during testing, namely the following columns:
+
 - `class`: string action label
 - `class_index`: integer action label	
 - `correct`: 1 if the action segment was correctly classified, 0 otherwise	
@@ -218,6 +218,7 @@ Each `training_dicts/epoch_${epoch_number}/${video_id}/` folder contains the fol
 
 ##### `${video_id}_plateaus.csv` 
 CSV containing information about the video's plateaus, with columns:
+
 - `c`: the *c* parameter of the plateau function at the given epoch
 - `w`: the *w* parameter of the plateau function at the given epoch
 - `s`: the *s* parameter of the plateau function at the given epoch
