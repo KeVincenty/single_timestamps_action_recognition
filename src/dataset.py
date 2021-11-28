@@ -48,7 +48,7 @@ class Dataset(data_utl.Dataset):
         self.n_samples = n_samples
         self.untrimmed = untrimmed
         self.classes = classes
-        self.n_classes = len(classes)
+        self.n_classes = 397
         self.sampling_strategy = sampling_strategy
         self.rgb_img_size = rgb_img_size
         self.flow_img_size = flow_img_size
@@ -147,6 +147,10 @@ class Dataset(data_utl.Dataset):
             class_str = video['class']
             class_index = video['class_index']
             label = int(class_index)
+        elif label_format == 'dict':
+            class_str = {'noun_class':eval(video['class'])[0], 'verb_class':eval(video['class'])[-1]}
+            class_index = {'noun_class':int(eval(video['class_index'])[0]), 'verb_class':int(eval(video['class_index'])[-1])}
+            label = class_index
         else:
             raise Exception('Unrecognised label label_format: '.format(label_format))
 
@@ -156,7 +160,7 @@ class Dataset(data_utl.Dataset):
         self.data = []
 
         for _, row in self.data_frame.iterrows():
-            (class_str, class_index, label) = self.make_label(row)
+            (class_str, class_index, label) = self.make_label(row, label_format='dict')
             video_dict = row.to_dict()
             video_dict['g_id'] = generate_plateau_id(**video_dict)
             self.data.append((video_dict, label, self.n_samples))
@@ -204,6 +208,9 @@ class Dataset(data_utl.Dataset):
     def build_rgb_path(self, video, frame_index):
         if self.name in ['beoid', 'thumos_14']:
             path = os.path.join(self.frames_path, 'jpegs', video, 'frame' + str(frame_index).zfill(6) + '.jpg')
+        elif 'epic_kitchen_100' in self.name:
+            video_prefix = video.split('_')[0]
+            path = os.path.join(self.frames_path, video_prefix, 'rgb_frames', video, 'frame_' + str(frame_index).zfill(10) + '.jpg')
         else:
             raise Exception('Unrecognised dataset: {}'.format(self.name))
 
@@ -213,6 +220,10 @@ class Dataset(data_utl.Dataset):
         if self.name in ['beoid', 'thumos_14']:
             x_path = os.path.join(self.frames_path, 'u', video, 'frame' + str(frame_index).zfill(6) + '.jpg')
             y_path = os.path.join(self.frames_path, 'v', video, 'frame' + str(frame_index).zfill(6) + '.jpg')
+        elif 'epic_kitchen_100' in self.name:
+            video_prefix = video.split('_')[0]
+            x_path = os.path.join(self.frames_path, video_prefix, 'flow_frames', video, 'u', 'frame_' + str(frame_index).zfill(10) + '.jpg')
+            y_path = os.path.join(self.frames_path, video_prefix, 'flow_frames', video, 'v', 'frame_' + str(frame_index).zfill(10) + '.jpg')
         else:
             raise Exception('Unrecognised dataset: {}'.format(self.name))
 

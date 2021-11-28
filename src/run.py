@@ -3,14 +3,21 @@ import os
 import sys
 import traceback
 import warnings
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
 
 import pandas as pd
+from scipy.optimize.zeros import results_c
 import torch.nn as nn
 import torch.optim
 import torch.utils.data.sampler as sampler
 import tqdm
 from sklearn.metrics import confusion_matrix
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
+from lr_schedule import LinearRampUpExponentialDecay
 
 import dataset
 import dataset_utils
@@ -19,7 +26,7 @@ import plots
 import single_timestamps
 import tsn_models
 import update
-from softmax_scores import get_softmax_scores_for_untrimmed_videos
+from softmax_scores import get_softmax_scores_for_untrimmed_videos, split_task_outputs
 from stat_meter import StatMeter
 from tsn_transforms import *
 
@@ -237,7 +244,14 @@ def set_data_loader(train_df, test_df, train_sampling_strategy, classes, video_l
                                transforms=test_transforms, untrimmed=False, stack_size=settings['of_stack_size'],
                                frames_are1_indexed=frame1_indexed)
 
-    train_data_loader = torch.utils.data.DataLoader(training_set, batch_size=batch_size_train, shuffle=True,
+    indexes = list(range(len(training_set)))
+    settings['indexes'] = indexes
+    random.seed()
+    random.shuffle(indexes)
+    batch_sampler = sampler.BatchSampler(indexes, batch_size=settings['training']['batch_size'], drop_last=False)
+    settings['batch_sampler'] = batch_sampler
+
+    train_data_loader = torch.utils.data.DataLoader(training_set, batch_sampler = batch_sampler,
                                                     num_workers=num_workers_train, pin_memory=True)
     test_data_loader = torch.utils.data.DataLoader(test_set, batch_size=batch_size_test, shuffle=False,
                                                    num_workers=num_workers_test, pin_memory=True)
@@ -292,9 +306,11 @@ def setup_tsn_bn_inception(n_classes, num_segments, mode='flow', stack_size=5, c
         tsn_bni.load_state_dict(torch.load(kinetics_state_path), strict=False)
 
     tsn_bni.cuda()
-    tsn_bni = nn.DataParallel(tsn_bni)
+    tsn_bni = nn.DataParallel(tsn_bni) 
+    num_param = sum([param.numel() for param in tsn_bni.parameters() if param.requires_grad])
 
     print('-> TSN BN Inception is ready')
+    print(f'-> The model has {(num_param/1e6):.2f}M parameters in total')
     print('=' * 80)
 
     return tsn_bni
@@ -328,7 +344,7 @@ def calculate_accuracy(output, target, top_k=(1,)):
     return accuracy_k, correct_k, pred_k
 
 
-def calculate_accuracy_and_loss_for_action(action_output, action_label, criterion, losses, top1, top5, results,
+def calculate_accuracy_and_loss_for_action(action_output, action_label, criterion, test_results, results,
                                            action_info, action_index, predicted_all, gt_labels):
     """
     Calculates accuracy and loss for an action instance
@@ -346,29 +362,79 @@ def calculate_accuracy_and_loss_for_action(action_output, action_label, criterio
     :param gt_labels: global ground truth labels (all actions), for the confusion matrix
     :return: nothing
     """
-    # averaging the scores
-    loss = criterion(action_output, action_label)
+    if settings['num_tasks'] == 2:
+        output = split_task_outputs(action_output, settings['num_classes'])
+        tasks = {
+            task: {
+                "output": output[task],
+                "preds": output[task].topk(5, -1)[1],
+                "labels": action_label[f"{task}_class"],
+                "weight": 1,
+            }
+            for task in ["noun", "verb"]
+        }
+        n_tasks = len(tasks)
+        loss = 0.
+        corrects, predicts = [], []
+        for task, d in tasks.items():
+            task_loss = criterion(d["output"], d["labels"])
+            loss += d["weight"] * task_loss
+            test_results[f'{task}_loss'].update(d["weight"] * task_loss.item(), 1)
 
-    # measure accuracy and record loss
-    (_, correct, predicted) = calculate_accuracy(action_output.data, action_label.data, top_k=(1, 5))
-    losses.update(loss.data[0], 1)
-    top1.update(correct[0], 1)
-    top5.update(correct[1], 1)
+            (_, correct, predicted) = calculate_accuracy(d["output"], d["labels"], top_k=(1, 5))
+            test_results[f"{task}_top1"].update(correct[0], 1)
+            test_results[f"{task}_top5"].update(correct[1], 1)
+            # adding global predictions for confusion matrix
+            corrects.append([x.cpu().numpy() for x in correct])
+            predicts.append(predicted.cpu().numpy())
+            predicted_all[task].append(predicted.cpu().numpy()[0][0])
+            gt_labels[task].append(d["labels"].cpu().numpy()[0])
 
-    # adding global predictions for confusion matrix
-    predicted_all.append(predicted.cpu().numpy()[0][0])
-    gt_labels.append(action_label.data.cpu().numpy()[0])
+        noun_preds = (tasks['noun']['preds'] == tasks['noun']['labels'].unsqueeze(-1))
+        verb_preds = (tasks['verb']['preds'] == tasks['verb']['labels'].unsqueeze(-1))
+        action_preds = noun_preds & verb_preds
+        test_results["action_top1"].update(action_preds[:,0].sum().item(), 1)
+        test_results["action_top5"].update(action_preds.sum().item(), 1)
+        test_results["action_loss"].update(loss.item() / n_tasks, 1)
 
-    info = {
-        'start_frame': action_info['start_frame'][action_index],
-        'stop_frame': action_info['stop_frame'][action_index],
-        'video_id': action_info['video_id'][action_index],
-        'class': action_info['class'][action_index],
-        'class_index': action_info['class_index'][action_index],
-        'frame_samples': action_info['frame_samples'][action_index].tolist(),
-        'correct': correct[0],
-        'predicted': predicted.t().tolist()[0]
-    }
+        info = {
+            'start_frame': action_info['start_frame'][action_index],
+            'stop_frame': action_info['stop_frame'][action_index],
+            'video_id': action_info['video_id'][action_index],
+            'noun_class': eval(action_info['class'][action_index])[0],
+            'verb_class': eval(action_info['class'][action_index])[1],
+            'noun_class_index': eval(action_info['class_index'][action_index])[0],
+            'verb_class_index': eval(action_info['class_index'][action_index])[1],
+            'frame_samples': action_info['frame_samples'][action_index].tolist(),
+            'noun_correct': corrects[0][0],
+            'verb_correct': corrects[1][0],
+            'noun_predicted': predicts[0].transpose().tolist()[0],
+            'verb_predicted': predicts[1].transpose().tolist()[0],
+        }
+    else:
+        with torch.no_grad():
+            loss = criterion(action_output, action_label)
+
+            # measure accuracy and record loss
+            (_, correct, predicted) = calculate_accuracy(action_output, action_label, top_k=(1, 5))
+            test_results['losses'].update(loss.item(), 1)
+            test_results['top1'].update(correct[0], 1)
+            test_results['top5'].update(correct[1], 1)
+
+            # adding global predictions for confusion matrix
+            predicted_all.append(predicted.cpu().numpy()[0][0])
+            gt_labels.append(action_label.cpu().numpy()[0])
+
+            info = {
+                'start_frame': action_info['start_frame'][action_index],
+                'stop_frame': action_info['stop_frame'][action_index],
+                'video_id': action_info['video_id'][action_index],
+                'class': action_info['class'][action_index],
+                'class_index': action_info['class_index'][action_index],
+                'frame_samples': action_info['frame_samples'][action_index].tolist(),
+                'correct': correct[0],
+                'predicted': predicted.t().tolist()[0]
+            }
 
     results.append(info)
 
@@ -395,33 +461,33 @@ def rank_and_select_frames(batch_indices, settings):
     bar = tqdm.tqdm(total=len(train_data_loader), desc='-> Ranking training frames...', file=sys.stdout)
     predictions = []
     model.eval()
+    with torch.no_grad():
+        for batch_iteration, (input_tuple) in enumerate(train_data_loader):
+            (input_batch, label_batch, videos_info) = input_tuple
+            batch_size = input_batch.shape[0]
 
-    for batch_iteration, (input_tuple) in enumerate(train_data_loader):
-        (input_batch, label_batch, videos_info) = input_tuple
-        batch_size = input_batch.shape[0]
+            input_var = input_batch.float().cuda(non_blocking=True)
+            output_batch = model(input_var, do_consensus=False)
 
-        input_var = torch.autograd.Variable(input_batch.float().cuda(async=True), volatile=True)
-        output_batch = model(input_var, do_consensus=False).data
+            for i in range(batch_size):
+                label = label_batch[i]
+                g_id = videos_info['g_id'][i]
+                centre_points = videos_info['centre_points'][i]
+                batch_index = batch_indices[batch_iteration][i]
 
-        for i in range(batch_size):
-            label = label_batch[i]
-            g_id = videos_info['g_id'][i]
-            centre_points = videos_info['centre_points'][i]
-            batch_index = batch_indices[batch_iteration][i]
+                for n in range(n_frames):
+                    p = output_batch[i, n, label]
+                    predictions.append(
+                        {
+                            'g_id': g_id,
+                            'label': label,
+                            'prediction': p,
+                            'point': centre_points[n],
+                            'batch_index': batch_index
+                        }
+                    )
 
-            for n in range(n_frames):
-                p = output_batch[i, n, label]
-                predictions.append(
-                    {
-                        'g_id': g_id,
-                        'label': label,
-                        'prediction': p,
-                        'point': centre_points[n],
-                        'batch_index': batch_index
-                    }
-                )
-
-        bar.update()
+            bar.update()
 
     bar.close()
     selected_frames = []
@@ -450,9 +516,21 @@ def train_loop(train_loader, model, criterion, optimizer, epoch, optimizer_step_
     :param print_freq: how often you want to print stuff
     :return: (losses, top1, top5), all of them as StatMeter objects
     """
-    losses = StatMeter()
-    top1 = StatMeter()
-    top5 = StatMeter()
+    results = {}
+    if settings['num_tasks'] == 2:
+        results['noun_loss'] = StatMeter()
+        results['noun_top1'] = StatMeter()
+        results['noun_top5'] = StatMeter()
+        results['verb_loss'] = StatMeter()
+        results['verb_top1'] = StatMeter()
+        results['verb_top5'] = StatMeter()
+        results['action_top1'] = StatMeter()
+        results['action_top5'] = StatMeter()
+        results['action_loss'] = StatMeter()
+    else:
+        results['losses'] = StatMeter()
+        results['top1'] = StatMeter()
+        results['top5'] = StatMeter()
     n_iterations = len(train_loader)
 
     # switch to train mode
@@ -461,7 +539,7 @@ def train_loop(train_loader, model, criterion, optimizer, epoch, optimizer_step_
     optimizer.zero_grad()  # set gradients to zero before starting the training loop
 
     for batch_iteration, (input_tuple) in enumerate(train_loader):
-        train_batch(input_tuple, criterion, model, losses, top1, top5)
+        train_batch(input_tuple, criterion, model, results)
 
         did_optimization_step = False
 
@@ -472,28 +550,49 @@ def train_loop(train_loader, model, criterion, optimizer, epoch, optimizer_step_
             did_optimization_step = True
 
         if batch_iteration % print_freq == 0:
-            print('Training Epoch: [{0}][{1}/{2}]\t'
+            if settings['num_tasks'] == 2:
+                    print('Training Epoch: [{0}][{1}/{2}]\t'
+                    'Action_Loss {loss.val:.4f} ({loss.total:.4f})\t'
+                    'Noun_Loss {noun_loss.val:.4f} ({noun_loss.total:.4f})\t'
+                    'Verb_Loss {verb_loss.val:.4f} ({verb_loss.total:.4f})\t'
+                    'Action_Acc@1 {action_top1.total:.3f}\t'
+                    'Action_Acc@5 {action_top5.total:.3f}\t'
+                    'Noun_Acc@1 {noun_top1.total:.3f}\t'
+                    'Noun_Acc@5 {noun_top5.total:.3f}\t'
+                    'Verb_Acc@1 {verb_top1.total:.3f}\t'
+                    'Verb_Acc@5 {verb_top5.total:.3f}\t'.format(epoch+1, batch_iteration + 1, n_iterations, loss=results['action_loss'], noun_loss=results['noun_loss'], verb_loss=results['verb_loss'], action_top1=results['action_top1'], action_top5=results['action_top5'],
+                    noun_top1=results['noun_top1'], noun_top5=results['noun_top5'], verb_top1=results['verb_top1'], verb_top5=results['verb_top5']))
+            else:
+                print('Training Epoch: [{0}][{1}/{2}]\t'
                   'Loss {loss.val:.4f} ({loss.total:.4f})\t'
                   'Acc@1 {top1.total:.3f}\t'
-                  'Acc@5 {top5.total:.3f}'.format(epoch+1, batch_iteration + 1, n_iterations, loss=losses, top1=top1,
-                                                  top5=top5))
+                  'Acc@5 {top5.total:.3f}'.format(epoch+1, batch_iteration + 1, n_iterations, loss=results['losses'], top1=results['top1'],
+                                                  top5=results['top5']))
 
             if optimizer_step_frequency > 1 and did_optimization_step:
                 print('Performed optimiser step and zero grad')
 
+    if settings['training']['learning_rate_decay']:
+        settings['lr_scheduler'].step()
+    
+    results['learning_rate'] = settings['optimizer'].param_groups[0]['lr']
+
     print('\n')
     print('-' * 80)
-    print('--> Total Training: Acc@1 {top1.total:.3f}\tAcc@5 {top5.total:.3f}'.format(top1=top1, top5=top5))
+    if settings['num_tasks'] == 2:
+        print('--> Total Training: Action_Acc@1 {action_top1.total:.3f}\tAction_Acc@5 {action_top5.total:.3f}\tNoun_Acc@1 {noun_top1.total:.3f}\tNoun_Acc@5 {noun_top5.total:.3f}\tVerb_Acc@1 {verb_top1.total:.3f}\tVerb_Acc@5 {verb_top5.total:.3f}\t'.format(action_top1=results['action_top1'], action_top5=results['action_top5'], noun_top1=results['noun_top1'], noun_top5=results['noun_top5'], verb_top1=results['verb_top1'], verb_top5=results['verb_top5']))
+    else:
+        print('--> Total Training: Acc@1 {top1.total:.3f}\tAcc@5 {top5.total:.3f}'.format(top1=results['top1'], top5=results['top5']))
     print('-' * 80)
 
-    return losses, top1, top5
+    return results
 
 
-def train_batch(input_tuple, criterion, model, losses, top1, top5):
+def train_batch(input_tuple, criterion, model, results):
     """
     Trains a single mini-batch. This function performs loss.backwards BUT NOT optimizer.step() NEITHER
     optimizer.zero_grad()
-
+ 
     :param input_tuple: input tuple coming from the data loader
     :param criterion: Pytorch criterion object
     :param model: Pytorch model
@@ -504,17 +603,56 @@ def train_batch(input_tuple, criterion, model, losses, top1, top5):
     """
     (input, label, videos_info) = input_tuple
 
-    input = torch.autograd.Variable(input.float().cuda(async=True))
-    label = torch.autograd.Variable(label.long().cuda(async=True))
+    input = input.float().cuda(non_blocking=True)
+    if settings['num_tasks'] == 2:
+        label = {k:v.long().cuda(non_blocking=True) for k,v in label.items()}
+    else:
+        label = label.long().cuda(non_blocking=True)
+    
     output = model(input)
-    loss = criterion(output, label)
-    loss.backward()
 
-    # measure accuracy and record loss
-    (_, correct, _) = calculate_accuracy(output.data, label.data, top_k=(1, 5))
-    losses.update(loss.data[0], input.data.size(0))
-    top1.update(correct[0], input.data.size(0))
-    top5.update(correct[1], input.data.size(0))
+    if settings['num_tasks'] == 2:
+        output = split_task_outputs(output, settings['num_classes'])
+        tasks = {
+            task: {
+                "output": output[task],
+                "preds": output[task].topk(5, -1)[1],
+                "labels": label[f"{task}_class"],
+                "weight": 1,
+            }
+            for task in ["noun", "verb"]
+        }
+        n_tasks = len(tasks)
+        loss = 0.
+        for task, d in tasks.items():
+            task_loss = criterion(d["output"], d["labels"])
+            loss += d["weight"] * task_loss
+            results[f'{task}_loss'].update(d["weight"] * task_loss.item(), input.size(0))
+
+            (_, correct, _) = calculate_accuracy(d["output"], d["labels"], top_k=(1, 5))
+            results[f"{task}_top1"].update(correct[0], input.size(0))
+            results[f"{task}_top5"].update(correct[1], input.size(0))
+
+        loss.backward()
+        with torch.no_grad():
+            noun_preds = (tasks['noun']['preds'] == tasks['noun']['labels'].unsqueeze(-1))
+            verb_preds = (tasks['verb']['preds'] == tasks['verb']['labels'].unsqueeze(-1))
+            action_preds = noun_preds & verb_preds
+            results["action_top1"].update(action_preds[:,0].sum().item(), input.size(0))
+            results["action_top5"].update(action_preds.sum().item(), input.size(0))
+            results["action_loss"].update(loss.item() / n_tasks, input.size(0))
+
+    else:    
+        loss = criterion(output, label)
+        loss.backward()
+
+        # measure accuracy and record loss
+        with torch.no_grad():
+            (_, correct, _) = calculate_accuracy(output, label, top_k=(1, 5))
+            
+            results['losses'].update(loss.item(), input.size(0))
+            results['top1'].update(correct[0], input.size(0))
+            results['top5'].update(correct[1], input.size(0))
 
 
 def train_with_ts(settings, train_dict, softmax_scores, plateaus_per_video, epoch, update_plateaus):
@@ -544,10 +682,8 @@ def train_with_ts(settings, train_dict, softmax_scores, plateaus_per_video, epoc
     n_points = settings['training']['n_samples']
     all_plateaus = single_timestamps.get_all_plateaus_in_dataset(plateaus_per_video)
 
-    indexes = list(range(len(train_data_loader.dataset)))
-    random.seed()
-    random.shuffle(indexes)
-    batch_sampler = sampler.BatchSampler(indexes, batch_size=settings['training']['batch_size'], drop_last=False)
+    indexes = settings['indexes']
+    batch_sampler = settings['batch_sampler']
     batch_indexes = list(batch_sampler)
     selected_plateaus = None
 
@@ -556,7 +692,7 @@ def train_with_ts(settings, train_dict, softmax_scores, plateaus_per_video, epoc
         # first sample N points from each plateau
         sampled_points = single_timestamps.sample_points_from_plateaus(all_plateaus, mode, stack_size=stack_size,
                                                                        n_samples=n_points)
-        train_data_loader.batch_sampler = batch_sampler
+        # train_data_loader.batch_sampler = batch_sampler
         train_data_loader.dataset.set_plateaus_samples(sampled_points)
 
         if update_plateaus:
@@ -624,12 +760,12 @@ def train_with_ts(settings, train_dict, softmax_scores, plateaus_per_video, epoc
     single_timestamps.add_sampled_points_to_train_info(train_dict, sampled_points, n_points, all_plateaus)
     save_training_info(path_for_train_dicts(export_path), train_dict, epoch, used_for_training=selected_plateaus)
 
-    (loss_train, top1_train, top5_train) = train_loop(train_data_loader, model, criterion, optimizer, epoch,
+    train_results = train_loop(train_data_loader, model, criterion, optimizer, epoch,
                                                       optimizer_step_frequency)
 
     step = epoch
-    write_tensorboard_accuracy_loss_logs(writer, 'train', loss_train, top1_train, top5_train, step)
-    save_epoch_info(settings, loss_train, top1_train, top5_train, epoch, 'train')
+    write_tensorboard_accuracy_loss_logs(writer, 'train', train_results, step)
+    save_epoch_info(settings, train_results, epoch, 'train')
 
 
 def train_with_gt(settings, epoch):
@@ -666,9 +802,21 @@ def test(epoch, settings, print_freq=1):
     writer = settings['log_writer']
     test_data_loader = settings['test_data_loader'] # this is used for testing
     export_path = settings['export_path']
-    loss = StatMeter()
-    top1 = StatMeter()
-    top5 = StatMeter()
+    test_results = {}
+    if settings['num_tasks'] == 2:
+        test_results['noun_loss'] = StatMeter()
+        test_results['noun_top1'] = StatMeter()
+        test_results['noun_top5'] = StatMeter()
+        test_results['verb_loss'] = StatMeter()
+        test_results['verb_top1'] = StatMeter()
+        test_results['verb_top5'] = StatMeter()
+        test_results['action_top1'] = StatMeter()
+        test_results['action_top5'] = StatMeter()
+        test_results['action_loss'] = StatMeter()
+    else:
+        test_results['losses'] = StatMeter()
+        test_results['top1'] = StatMeter()
+        test_results['top5'] = StatMeter()
     results = []
     model = settings['model']
     val_loader = settings['test_data_loader']
@@ -676,48 +824,91 @@ def test(epoch, settings, print_freq=1):
 
     # switch to evaluate mode
     model.eval()
-
-    gt_labels = []
-    predicted_all = []
+    if settings['num_tasks'] == 2:
+        gt_labels = {'noun':[], 'verb':[]}
+        predicted_all = {'noun':[], 'verb':[]}
+    else:
+        gt_labels = []
+        predicted_all = []
     model_name = val_loader.dataset.model_name
+    with torch.no_grad():
+        for i, (input, label, action_info) in enumerate(val_loader):
+            input = input.float().cuda(non_blocking=True)
+            if settings['num_tasks'] == 2:
+                label = {k:v.long().cuda(non_blocking=True) for k,v in label.items()}
+            else:
+                label = label.long().cuda(non_blocking=True)
 
-    for i, (input, label, action_info) in enumerate(val_loader):
-        input = input.float().cuda(async=True)
-        label = label.long().cuda(async=True)
+            if model_name == 'tsn_bni':
+                action_label = label
+                action_output = classify_action_with_tsn_bni(input, settings)
+                calculate_accuracy_and_loss_for_action(action_output, action_label, criterion, test_results, results,
+                                                    action_info, 0, predicted_all, gt_labels)
+            else:
+                raise Exception('Unrecognised model: {}'.format(val_loader.dataset.model_name))
 
-        if model_name == 'tsn_bni':
-            action_label = torch.autograd.Variable(label)
-            action_output = classify_action_with_tsn_bni(input, settings)
-            calculate_accuracy_and_loss_for_action(action_output, action_label, criterion, loss, top1, top5, results,
-                                                   action_info, 0, predicted_all, gt_labels)
-        else:
-            raise Exception('Unrecognised model: {}'.format(val_loader.dataset.model_name))
-
-        if i % print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Loss {loss.total:.4f}\t'
-                  'Acc@1 {top1.total:.3f}\t'
-                  'Acc@5 {top5.total:.3f}'.format(i+1, len(val_loader), loss=loss, top1=top1, top5=top5))
+            if i % print_freq == 0:
+                if settings['num_tasks'] == 2:
+                     print('Test: [{0}/{1}]\t'
+                    'Action_Loss {loss.val:.4f} ({loss.total:.4f})\t'
+                    'Noun_Loss {noun_loss.val:.4f} ({noun_loss.total:.4f})\t'
+                    'Verb_Loss {verb_loss.val:.4f} ({verb_loss.total:.4f})\t'
+                    'Action_Acc@1 {action_top1.total:.3f}\t'
+                    'Action_Acc@5 {action_top5.total:.3f}\t'
+                    'Noun_Acc@1 {noun_top1.total:.3f}\t'
+                    'Noun_Acc@5 {noun_top5.total:.3f}\t'
+                    'Verb_Acc@1 {verb_top1.total:.3f}\t'
+                    'Verb_Acc@5 {verb_top5.total:.3f}\t'.format(i+1, len(val_loader), loss=test_results['action_loss'], noun_loss=test_results['noun_loss'], verb_loss=test_results['verb_loss'], action_top1=test_results['action_top1'], action_top5=test_results['action_top5'],
+                    noun_top1=test_results['noun_top1'], noun_top5=test_results['noun_top5'], verb_top1=test_results['verb_top1'], verb_top5=test_results['verb_top5']))
+                else:
+                    print('Test: [{0}/{1}]\t'
+                    'Loss {loss.total:.4f}\t'
+                    'Acc@1 {top1.total:.3f}\t'
+                    'Acc@5 {top5.total:.3f}'.format(i+1, len(val_loader), loss=test_results['losses'], top1=test_results['top1'], top5=test_results['top5']))
 
     print('\n')
     print('-' * 80)
-    print('--> Total Testing: Acc@1 {top1.total:.3f}\tAcc@5 {top5.total:.3f}'.format(top1=top1, top5=top5))
+    if settings['num_tasks'] == 2:
+        print('--> Total Testing: Action_Acc@1 {action_top1.total:.3f}\tAction_Acc@5 {action_top5.total:.3f}\tNoun_Acc@1 {noun_top1.total:.3f}\tNoun_Acc@5 {noun_top5.total:.3f}\tVerb_Acc@1 {verb_top1.total:.3f}\tVerb_Acc@5 {verb_top5.total:.3f}\t'.format(action_top1=test_results['action_top1'], action_top5=test_results['action_top5'], noun_top1=test_results['noun_top1'], noun_top5=test_results['noun_top5'], verb_top1=test_results['verb_top1'], verb_top5=test_results['verb_top5']))
+    else:
+        print('--> Total Testing: Acc@1 {top1.total:.3f}\tAcc@5 {top5.total:.3f}'.format(top1=test_results['top1'], top5=test_results['top5']))
     print('-' * 80)
 
-    cm = confusion_matrix(np.array(gt_labels), np.array(predicted_all))
-    results = pd.DataFrame(results)
-    save_epoch_info(settings, loss, top1, top5, epoch, 'test')
+    if settings['num_tasks'] == 2:
+        noun_cm = confusion_matrix(np.array(gt_labels['noun']), np.array(predicted_all['noun']))
+        verb_cm = confusion_matrix(np.array(gt_labels['verb']), np.array(predicted_all['verb']))
+        results = pd.DataFrame(results)
+        save_epoch_info(settings, test_results, epoch, 'test')
 
-    write_tensorboard_accuracy_loss_logs(writer, 'test', loss, top1, top5, epoch)
-    cm_figure = plots.plot_confusion_matrix(cm, list(test_data_loader.dataset.class_labels.values()))
-    cm_img = plots.figure_to_img(cm_figure)
+        write_tensorboard_accuracy_loss_logs(writer, 'test', test_results, epoch)
+        # noun_cm_figure = plots.plot_confusion_matrix(noun_cm, list(test_data_loader.dataset.class_labels.values()))
+        # verb_cm_figure = plots.plot_confusion_matrix(verb_cm, list(test_data_loader.dataset.class_labels.values()))
+        # noun_cm_img = plots.figure_to_img(noun_cm_figure)
+        # verb_cm_img = plots.figure_to_img(verb_cm_figure)
 
-    try:
-        writer.add_image('Confusion_Matrix', torch.from_numpy(cm_img).permute(2, 0, 1), epoch)
-        save_results(path_for_results(export_path), results, cm, epoch)
-    except Exception:
-        traceback.print_exc()
-        warnings.warn('Could not add confusion matrix image to tensorboard logs!')
+        try:
+            # writer.add_image('Noun_Confusion_Matrix', torch.from_numpy(noun_cm_img).permute(2, 0, 1), epoch)
+            # writer.add_image('Verb_Confusion_Matrix', torch.from_numpy(verb_cm_img).permute(2, 0, 1), epoch)
+            save_results(path_for_results(export_path), results, noun_cm, verb_cm, epoch)
+        except Exception:
+            traceback.print_exc()
+            warnings.warn('Could not add confusion matrix image to tensorboard logs!')
+
+    else:
+        cm = confusion_matrix(np.array(gt_labels), np.array(predicted_all))
+        results = pd.DataFrame(results)
+        save_epoch_info(settings, test_results, epoch, 'test')
+
+        write_tensorboard_accuracy_loss_logs(writer, 'test', test_results, epoch)
+        cm_figure = plots.plot_confusion_matrix(cm, list(test_data_loader.dataset.class_labels.values()))
+        cm_img = plots.figure_to_img(cm_figure)
+
+        try:
+            writer.add_image('Confusion_Matrix', torch.from_numpy(cm_img).permute(2, 0, 1), epoch)
+            save_results(path_for_results(export_path), results, cm, epoch)
+        except Exception:
+            traceback.print_exc()
+            warnings.warn('Could not add confusion matrix image to tensorboard logs!')
 
     print('-' * 80)
 
@@ -757,19 +948,18 @@ def classify_action_with_tsn_bni(input, settings, num_crops=None, n_samples=None
         raise ValueError("Unknown modality " + mode)
 
     if num_crops == 10:
-        input_var = torch.autograd.Variable(input.view(-1, length, input.size(2), input.size(3)), volatile=True)
+        input_var = input.view(-1, length, input.size(2), input.size(3))
     elif num_crops == 1:
-        input_var = torch.autograd.Variable(input, volatile=True)
+        input_var = input
     else:
         raise Exception('Cannot deal with num_crops={}'.format(num_crops))
 
     action_output = model(input_var, do_consensus=False, override_reshape=False).data
-    action_output = torch.mean(action_output.view((num_crops, n_samples, n_classes)), 0).view((n_samples,
-                                                                                               n_classes))
+    action_output = torch.mean(action_output.view((num_crops, n_samples, n_classes)), 0).view((n_samples, n_classes))
 
     if average_scores:
         # averaging the scores
-        action_output = torch.autograd.Variable(torch.mean(action_output, 0, keepdim=True).cuda())
+        action_output = torch.mean(action_output, 0, keepdim=True).cuda()
 
     return action_output
 
@@ -858,9 +1048,7 @@ def run(settings):
         do_update = is_baseline_with_update(baseline) and should_update(iteration, epoch, settings)
 
         if do_update:
-            (softmax_scores, logit_scores, _) = get_softmax_scores_for_untrimmed_videos(
-                untrimmed_data_loader, model, settings['mode'], settings['of_stack_size'])
-
+            (softmax_scores, logit_scores, _) = get_softmax_scores_for_untrimmed_videos(untrimmed_data_loader, model, settings['mode'], settings['of_stack_size'])
             if save_scores:
                 save_video_scores(path_for_train_dicts(export_path), softmax_scores, logit_scores, epoch)
 
@@ -923,7 +1111,7 @@ def update_has_started(epoch, settings):
     return is_baseline_with_update(settings['baseline']) and epoch >= settings['update']['start_epoch']
 
 
-def save_epoch_info(settings, loss, top1_accuracy, top5_accuracy, epoch, train_or_test):
+def save_epoch_info(settings, results, epoch, train_or_test):
     """
     Writes/updates a csv containing information for each epoch
 
@@ -936,18 +1124,34 @@ def save_epoch_info(settings, loss, top1_accuracy, top5_accuracy, epoch, train_o
     :return: nothing
     """
     df_path = os.path.join(settings['export_path'], '{}_info.csv'.format(train_or_test))
-
-    epoch_info = {
-        'epoch': epoch,
-        'loss': loss.total,
-        'top1_accuracy': top1_accuracy.total,
-        'top5_accuracy': top5_accuracy.total
-    }
+    if settings['num_tasks'] == 2:
+        epoch_info = {
+            'epoch': epoch,
+            'action_loss': results['action_loss'].total,
+            'noun_loss': results['noun_loss'].total,
+            'verb_loss': results['verb_loss'].total,
+            'action_top1_accuracy': results['action_top1'].total,
+            'action_top5_accuracy': results['action_top5'].total,
+            'noun_top1_accuracy': results['noun_top1'].total,
+            'noun_top5_accuracy': results['noun_top5'].total,
+            'verb_top1_accuracy': results['verb_top1'].total,
+            'verb_top5_accuracy': results['verb_top5'].total,
+        }
+    else:
+        epoch_info = {
+            'epoch': epoch,
+            'loss': results['losses'].total,
+            'top1_accuracy': results['top1'].total,
+            'top5_accuracy': results['top5'].total
+        }
 
     epoch_df = pd.DataFrame([epoch_info])
 
     if os.path.exists(df_path):
-        df = pd.read_csv(df_path, usecols=['epoch', 'loss', 'top1_accuracy', 'top5_accuracy'])
+        if settings['num_tasks'] == 2:
+            df = pd.read_csv(df_path, usecols=['epoch', 'action_loss', 'noun_loss', 'verb_loss', 'action_top1_accuracy', 'action_top5_accuracy', 'noun_top1_accuracy', 'noun_top5_accuracy', 'verb_top1_accuracy', 'verb_top5_accuracy'])
+        else:
+            df = pd.read_csv(df_path, usecols=['epoch', 'loss', 'top1_accuracy', 'top5_accuracy'])
         df = df.append(epoch_df, ignore_index=True)
     else:
         df = epoch_df
@@ -955,7 +1159,7 @@ def save_epoch_info(settings, loss, top1_accuracy, top5_accuracy, epoch, train_o
     df.to_csv(df_path, index=False)
 
 
-def write_tensorboard_accuracy_loss_logs(writer, phase, loss, top1, top5, epoch):
+def write_tensorboard_accuracy_loss_logs(writer, phase, results, epoch):
     """
     Writes tensorboard accuracy and loss logs
 
@@ -967,12 +1171,26 @@ def write_tensorboard_accuracy_loss_logs(writer, phase, loss, top1, top5, epoch)
     :param epoch: epoch number
     :return: nothing
     """
-    writer.add_scalar('{}/loss'.format(phase), loss.total, epoch)
-    writer.add_scalar('{}/Acc@1'.format(phase), top1.total, epoch)
-    writer.add_scalar('{}/Acc@5'.format(phase), top5.total, epoch)
+    if settings['num_tasks'] == 2:
+        writer.add_scalar('{}/action_loss'.format(phase), results['action_loss'].total, epoch)
+        writer.add_scalar('{}/noun_loss'.format(phase), results['noun_loss'].total, epoch)
+        writer.add_scalar('{}/verb_loss'.format(phase), results['verb_loss'].total, epoch)
+        writer.add_scalar('{}/Action_Acc@1'.format(phase), results['action_top1'].total, epoch)
+        writer.add_scalar('{}/Action_Acc@5'.format(phase), results['action_top5'].total, epoch)
+        writer.add_scalar('{}/Noun_Acc@1'.format(phase), results['noun_top1'].total, epoch)
+        writer.add_scalar('{}/Noun_Acc@5'.format(phase), results['noun_top5'].total, epoch)
+        writer.add_scalar('{}/Verb_Acc@1'.format(phase), results['verb_top1'].total, epoch)
+        writer.add_scalar('{}/Verb_Acc@5'.format(phase), results['verb_top5'].total, epoch)
+    else:
+        writer.add_scalar('{}/loss'.format(phase), results['losses'].total, epoch)
+        writer.add_scalar('{}/Acc@1'.format(phase), results['top1'].total, epoch)
+        writer.add_scalar('{}/Acc@5'.format(phase), results['top5'].total, epoch)
+        writer.add_scalar('{}/Verb_Acc@5'.format(phase), results['learning_rate'], epoch)
+    if phase == 'train':
+        writer.add_scalar('learning_rate', results['learning_rate'], epoch)
 
 
-def save_results(results_export_path, results, confusion_matrix, epoch):
+def save_results(results_export_path, results, noun_confusion_matrix, verb_confusion_matrix, epoch):
     """
     Saves a csv containing results information, as well as the confusion matrices as text files
 
@@ -990,7 +1208,8 @@ def save_results(results_export_path, results, confusion_matrix, epoch):
     csv_path = os.path.join(results_export_path, 'epoch_{}.csv'.format(epoch))
     results.to_csv(csv_path, index=False)
     cm_path = os.path.join(cm_folder, 'epoch_{}.csv'.format(epoch))
-    np.savetxt(cm_path, confusion_matrix, delimiter=',')
+    np.savetxt(cm_path, noun_confusion_matrix, delimiter=',')
+    np.savetxt(cm_path, verb_confusion_matrix, delimiter=',')
 
 
 def save_training_info(train_dict_export_path, train_dict, epoch, used_for_training=None):
@@ -1274,7 +1493,10 @@ def setup(settings, tag=None):
             checkpoint_epoch = -1
 
     (train_df, test_df, class_labels, class_map, video_lengths) = load_annotations(settings)
-    n_classes = len(class_labels)
+    if isinstance(settings['num_classes'], dict):
+        n_classes = sum([num for _, num in settings['num_classes'].items()])
+    else:
+        n_classes = max(len(class_labels), settings['num_classes'])
 
     if checkpoint_path is not None:
         print('-> Loading checkpoint from {}'.format(checkpoint_path))
@@ -1305,6 +1527,9 @@ def setup(settings, tag=None):
     # define loss function (criterion) and optimiser
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=settings['training']['learning_rate'])
+    if settings['training']['learning_rate_decay']:
+        scheduler = LinearRampUpExponentialDecay(optimizer, 5, 70, 0.95, last_epoch=-1, verbose=False)
+        settings['lr_scheduler'] = scheduler
 
     if checkpoint_path is not None and 'optimizer' in checkpoint:
         print('-> Loading optimizer state')
@@ -1372,6 +1597,8 @@ if __name__ == '__main__':
         else:
             assert key in settings, 'Key {} not found in the configuration file!'.format(key)
             settings[key] = value
+
+    assert settings['num_tasks'] == len(settings['num_classes'])
 
     if args.start_from_best_in is not None:
         if settings['test_only']:

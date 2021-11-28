@@ -61,7 +61,7 @@ def initialise_plateaus_for_video(df, video, n_frames, init_w, init_s, class0_in
 
         points_info[point] = {
                                 'point': point,
-                                'label': row['class_index'] - class_shift,
+                                'label': {'noun_class':int(eval(row['class_index'])[0])- class_shift, 'verb_class':int(eval(row['class_index'])[-1])- class_shift},
                                 'id': generate_plateau_id(**row)
                             }
 
@@ -72,7 +72,7 @@ def initialise_plateaus_for_video(df, video, n_frames, init_w, init_s, class0_in
         point = g.c
         label = points_info[point]['label']
         g_id = points_info[point]['id']
-        g.set_label(int(label))
+        g.set_label(label)
         g.set_id(g_id)
         g.set_index(i) # this is the order of the action in the video
         g.set_video(video)
